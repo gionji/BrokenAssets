@@ -1,0 +1,5 @@
+{
+  "name": "3D Mesh Shatter Studio",
+  "description": "A sophisticated WebGL application built with Three.js that allows users to upload 3D models and dynamically shatter them into physically-inspired fragments with interactive explosion controls.",
+  "requestFramePermissions": []
+}
