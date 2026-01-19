@@ -5,6 +5,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import GUI from 'lil-gui';
+import JSZip from 'jszip';
 import { shatterMesh } from '../services/shatterEngine';
 import { FragmentData } from '../types';
 
@@ -18,12 +19,6 @@ interface Box2D {
   width: number;
   height: number;
   label: string;
-}
-
-interface DatasetSample {
-  id: number;
-  image: string; // base64
-  annotations: string[]; // YOLO format strings
 }
 
 const Viewer: React.FC<ViewerProps> = ({ file }) => {
@@ -40,6 +35,9 @@ const Viewer: React.FC<ViewerProps> = ({ file }) => {
   const boxHelpersRef = useRef<THREE.BoxHelper[]>([]);
   const textureCacheRef = useRef<THREE.Texture[]>([]);
   const envTextureRef = useRef<THREE.Texture | null>(null);
+  
+  const ambientLightRef = useRef<THREE.AmbientLight | null>(null);
+  const directionalLightRef = useRef<THREE.DirectionalLight | null>(null);
   
   const [boxes2D, setBoxes2D] = useState<Box2D[]>([]);
 
@@ -75,9 +73,15 @@ const Viewer: React.FC<ViewerProps> = ({ file }) => {
     randomizeHue: true,
     randomizeRoughness: true,
     // Dataset Generation
-    batchN: 5,
+    batchN: 10,
     randomizeCamera: true,
+    camDistMin: 6,
+    camDistMax: 15,
+    randomizeLights: true,
+    lightMin: 0.2,
+    lightMax: 2.0,
     isGenerating: false,
+    generationStatus: 'Initializing...',
     generateDataset: () => {},
     // State/Actions
     shattered: false,
@@ -87,7 +91,6 @@ const Viewer: React.FC<ViewerProps> = ({ file }) => {
     exportGLB: () => {}
   });
 
-  // Helper to generate procedural textures
   const createProceduralTexture = (type: string, color1: string, color2: string, scale: number) => {
     const size = 512;
     const canvas = document.createElement('canvas');
@@ -161,13 +164,15 @@ const Viewer: React.FC<ViewerProps> = ({ file }) => {
     controls.enableDamping = true;
     controlsRef.current = controls;
 
-    // Lights
-    scene.add(new THREE.AmbientLight(0xffffff, 0.2));
+    const ambient = new THREE.AmbientLight(0xffffff, 0.2);
+    scene.add(ambient);
+    ambientLightRef.current = ambient;
+
     const dLight = new THREE.DirectionalLight(0xffffff, 1.0);
     dLight.position.set(5, 10, 5);
     scene.add(dLight);
+    directionalLightRef.current = dLight;
     
-    // Groups
     const originalGroup = new THREE.Group();
     const fragmentGroup = new THREE.Group();
     const bboxGroup = new THREE.Group();
@@ -176,7 +181,6 @@ const Viewer: React.FC<ViewerProps> = ({ file }) => {
     fragmentGroupRef.current = fragmentGroup;
     bboxGroupRef.current = bboxGroup;
 
-    // Volume Gizmo
     const volumeGeo = new THREE.BoxGeometry(1, 1, 1);
     const volumeEdges = new THREE.EdgesGeometry(volumeGeo);
     const volumeMat = new THREE.LineBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.3 });
@@ -217,7 +221,6 @@ const Viewer: React.FC<ViewerProps> = ({ file }) => {
       });
     };
 
-    // GUI
     const gui = new GUI({ title: 'Shatter Studio Pro' });
     
     const envFolder = gui.addFolder('Environment & Lighting');
@@ -260,87 +263,110 @@ const Viewer: React.FC<ViewerProps> = ({ file }) => {
     vizFolder.add(settings.current, 'showBBoxes2D').name('YOLO 2D Boxes');
 
     const datasetFolder = gui.addFolder('Dataset Generator');
-    datasetFolder.add(settings.current, 'batchN', 1, 100, 1).name('Samples (N)');
+    datasetFolder.add(settings.current, 'batchN', 1, 500, 1).name('Samples (N)');
     datasetFolder.add(settings.current, 'randomizeCamera').name('Random Viewpoint');
+    datasetFolder.add(settings.current, 'camDistMin', 0.1, 1.0).name('Min Dist (Bar)');
+    datasetFolder.add(settings.current, 'camDistMax', 0.1, 1.0).name('Max Dist (Bar)');
+    datasetFolder.add(settings.current, 'randomizeLights').name('Randomize Lights');
+    datasetFolder.add(settings.current, 'lightMin', 0.1, 5.0).name('Min Light');
+    datasetFolder.add(settings.current, 'lightMax', 0.1, 5.0).name('Max Light');
     
     settings.current.generateDataset = async () => {
       if (settings.current.isGenerating) return;
       settings.current.isGenerating = true;
+      setBoxes2D([]); // Clear boxes for render clarity
       gui.domElement.style.pointerEvents = 'none';
       gui.domElement.style.opacity = '0.5';
 
-      const results: DatasetSample[] = [];
+      const zip = new JSZip();
+      const imagesFolder = zip.folder("images");
+      const labelsFolder = zip.folder("labels");
       const n = settings.current.batchN;
 
       for (let i = 0; i < n; i++) {
-        // 1. Randomize State
+        settings.current.generationStatus = `Generating Sample ${i + 1} of ${n}...`;
+        
+        // 1. Re-Shatter
         performReShatter();
+        
+        // 2. Camera Positioning
         if (settings.current.randomizeCamera) {
           const theta = Math.random() * Math.PI * 2;
-          const phi = Math.random() * Math.PI * 0.5 + 0.1;
-          const r = 6 + Math.random() * 8;
+          const phi = Math.random() * (Math.PI * 0.4) + 0.1;
+          const dMin = settings.current.camDistMin;
+          const dMax = Math.max(dMin, settings.current.camDistMax);
+          const r = dMin + Math.random() * (dMax - dMin);
           camera.position.setFromSphericalCoords(r, phi, theta);
           camera.lookAt(0, 0, 0);
           controls.update();
         }
-        await loadRandomBackground();
 
-        // 2. Forced Render
+        // 3. Environment & Lights
+        await loadRandomBackground();
+        if (settings.current.randomizeLights && ambientLightRef.current && directionalLightRef.current) {
+          const lMin = settings.current.lightMin;
+          const lMax = Math.max(lMin, settings.current.lightMax);
+          ambientLightRef.current.intensity = lMin + Math.random() * (lMax - lMin) * 0.3;
+          directionalLightRef.current.intensity = lMin + Math.random() * (lMax - lMin);
+          directionalLightRef.current.position.set(
+            (Math.random() - 0.5) * 20,
+            Math.random() * 20,
+            (Math.random() - 0.5) * 20
+          );
+        }
+
+        // 4. Render and Capture
         renderer.render(scene, camera);
         
-        // 3. Capture RGB
-        const base64Img = renderer.domElement.toDataURL('image/png');
+        const imageBlob = await new Promise<Blob | null>(resolve => renderer.domElement.toBlob(resolve, 'image/png'));
+        if (imageBlob) {
+          const fileName = `sample_${i.toString().padStart(5, '0')}`;
+          imagesFolder?.file(`${fileName}.png`, imageBlob);
 
-        // 4. Capture YOLO BBoxes (synchronously calculated)
-        const annotations: string[] = [];
-        const width = window.innerWidth, height = window.innerHeight;
+          // 5. Annotations
+          const yoloLines: string[] = [];
+          fragmentsRef.current.forEach((f) => {
+            const box = new THREE.Box3().setFromObject(f.mesh);
+            const corners = [
+              new THREE.Vector3(box.min.x, box.min.y, box.min.z), new THREE.Vector3(box.min.x, box.min.y, box.max.z),
+              new THREE.Vector3(box.min.x, box.max.y, box.min.z), new THREE.Vector3(box.min.x, box.max.y, box.max.z),
+              new THREE.Vector3(box.max.x, box.min.y, box.min.z), new THREE.Vector3(box.max.x, box.min.y, box.max.z),
+              new THREE.Vector3(box.max.x, box.max.y, box.min.z), new THREE.Vector3(box.max.x, box.max.y, box.max.z),
+            ];
+            
+            let minX = 1, minY = 1, maxX = -1, maxY = -1;
+            corners.forEach(c => {
+              c.project(camera);
+              minX = Math.min(minX, c.x); maxX = Math.max(maxX, c.x);
+              minY = Math.min(minY, c.y); maxY = Math.max(maxY, c.y);
+            });
 
-        fragmentsRef.current.forEach((f, idx) => {
-          const box = new THREE.Box3().setFromObject(f.mesh);
-          const corners = [
-            new THREE.Vector3(box.min.x, box.min.y, box.min.z), new THREE.Vector3(box.min.x, box.min.y, box.max.z),
-            new THREE.Vector3(box.min.x, box.max.y, box.min.z), new THREE.Vector3(box.min.x, box.max.y, box.max.z),
-            new THREE.Vector3(box.max.x, box.min.y, box.min.z), new THREE.Vector3(box.max.x, box.min.y, box.max.z),
-            new THREE.Vector3(box.max.x, box.max.y, box.min.z), new THREE.Vector3(box.max.x, box.max.y, box.max.z),
-          ];
-          
-          let minX = 1, minY = 1, maxX = -1, maxY = -1;
-          corners.forEach(c => {
-            c.project(camera);
-            minX = Math.min(minX, c.x); maxX = Math.max(maxX, c.x);
-            minY = Math.min(minY, c.y); maxY = Math.max(maxY, c.y);
+            if (maxX > -1 && minX < 1 && maxY > -1 && minY < 1) {
+              const normMinX = Math.max(0, (minX + 1) / 2);
+              const normMaxX = Math.min(1, (maxX + 1) / 2);
+              const normMinY = Math.max(0, (1 - maxY) / 2);
+              const normMaxY = Math.min(1, (1 - minY) / 2);
+
+              const w = normMaxX - normMinX;
+              const h = normMaxY - normMinY;
+              const cx = normMinX + w / 2;
+              const cy = normMinY + h / 2;
+              yoloLines.push(`0 ${cx.toFixed(6)} ${cy.toFixed(6)} ${w.toFixed(6)} ${h.toFixed(6)}`);
+            }
           });
+          labelsFolder?.file(`${fileName}.txt`, yoloLines.join('\n'));
+        }
 
-          // Only add if visible in frustum
-          if (maxX > -1 && minX < 1 && maxY > -1 && minY < 1) {
-            // Normalize to 0-1 range
-            const normMinX = Math.max(0, (minX + 1) / 2);
-            const normMaxX = Math.min(1, (maxX + 1) / 2);
-            const normMinY = Math.max(0, (1 - maxY) / 2);
-            const normMaxY = Math.min(1, (1 - minY) / 2);
-
-            const w = normMaxX - normMinX;
-            const h = normMaxY - normMinY;
-            const cx = normMinX + w / 2;
-            const cy = normMinY + h / 2;
-
-            // Format: class x_center y_center width height
-            annotations.push(`0 ${cx.toFixed(6)} ${cy.toFixed(6)} ${w.toFixed(6)} ${h.toFixed(6)}`);
-          }
-        });
-
-        results.push({ id: i, image: base64Img, annotations });
-        
-        // Small delay to keep UI responsive
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise(r => setTimeout(r, 50));
       }
 
-      // Final Export
-      const blob = new Blob([JSON.stringify(results, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
+      // 6. Finalization & ZIP Compression
+      settings.current.generationStatus = 'Compressing Dataset into ZIP...';
+      const zipBlob = await zip.generateAsync({ type: "blob" });
+      const url = URL.createObjectURL(zipBlob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `shatter_dataset_${Date.now()}.json`;
+      link.download = `shatter_dataset_yolo_${Date.now()}.zip`;
       link.click();
       URL.revokeObjectURL(url);
 
@@ -348,7 +374,7 @@ const Viewer: React.FC<ViewerProps> = ({ file }) => {
       gui.domElement.style.pointerEvents = 'auto';
       gui.domElement.style.opacity = '1.0';
     };
-    datasetFolder.add(settings.current, 'generateDataset').name('🚀 START BATCH GEN');
+    datasetFolder.add(settings.current, 'generateDataset').name('🚀 START BATCH ZIP GEN');
 
     settings.current.shatter = () => performShatter();
     settings.current.reShatter = () => performReShatter();
@@ -621,10 +647,33 @@ const Viewer: React.FC<ViewerProps> = ({ file }) => {
       </svg>
       {/* Generation Loader Overlay */}
       {settings.current.isGenerating && (
-        <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center z-50 pointer-events-auto">
-          <div className="w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-4"></div>
-          <p className="text-blue-400 font-bold tracking-widest uppercase animate-pulse">Generating Batch Dataset...</p>
-          <p className="text-white/40 text-xs mt-2 italic">Capturing RGB frames & YOLO labels. Please wait.</p>
+        <div className="absolute inset-0 bg-black/90 backdrop-blur-xl flex flex-col items-center justify-center z-50 pointer-events-auto">
+          <div className="relative mb-8">
+            <div className="w-24 h-24 border-2 border-blue-500/20 rounded-full"></div>
+            <div className="absolute top-0 left-0 w-24 h-24 border-t-2 border-blue-500 rounded-full animate-spin"></div>
+            <div className="absolute inset-0 flex items-center justify-center">
+              <span className="text-blue-500 font-black text-xl">ZIP</span>
+            </div>
+          </div>
+          <p className="text-blue-400 font-black tracking-[0.2em] uppercase mb-2 animate-pulse text-lg">
+            {settings.current.generationStatus}
+          </p>
+          <div className="w-64 h-1 bg-white/10 rounded-full overflow-hidden">
+            <div className="h-full bg-blue-500 animate-progress origin-left"></div>
+          </div>
+          <style>{`
+            @keyframes progress {
+              0% { transform: scaleX(0); }
+              50% { transform: scaleX(0.7); }
+              100% { transform: scaleX(1); }
+            }
+            .animate-progress {
+              animation: progress 2s infinite linear;
+            }
+          `}</style>
+          <p className="text-white/30 text-[10px] mt-6 italic max-w-xs text-center">
+            Organizing files into /images and /labels. Packing as YOLO compliant dataset.
+          </p>
         </div>
       )}
     </div>
